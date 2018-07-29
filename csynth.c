@@ -29,6 +29,7 @@
 typedef enum {TIME_DOMAIN, FREQ_DOMAIN, TIME_DOMAIN_TEST} domain_t;
 domain_t domain = 0;
 
+SDL_mutex *mutex;
 SDL_Window* window = NULL;
 SDL_Renderer* renderer = NULL;
 SDL_Point points_time[N_POINTS_TIME];
@@ -173,8 +174,8 @@ void update_points_freq(SDL_Point *points, kiss_fft_cpx *signal)
     int i;
     for (i = 0; i < FRAMES_PER_BUFFER/2; i++) {
         mag = sqrt((signal[i].r * signal[i].r) + (signal[i].i * signal[i].i));
-        points[i].x = i * X_SCALE_FREQ ;
-        points[i].y = mag * Y_SCALE_FREQ ;
+        points[i].x = i * X_SCALE_FREQ;
+        points[i].y = mag * Y_SCALE_FREQ;
     }
 }
 
@@ -375,27 +376,33 @@ void calc_all_wavetables(double *freq_table)
 
 void init_oscillator(oscillator *bank, int freq_index, float gain, wave_t type, double *freq_table, envelope *env)
 {
-    //bank[freq_index].phase_index = 0;
-    bank[freq_index].phase_step = freq_table[freq_index] / FUNDAMENTAL_FREQ;
-    bank[freq_index].gain = gain;
-    bank[freq_index].octave = freq_index / 12;
-    bank[freq_index].type = type;
-    bank[freq_index].envelope_stage = ATTACK;
-    int cur_index = bank[freq_index].envelope_index;
-    if (cur_index > 0) {
-        float cur_amp = env[freq_index].release[cur_index];
-        bank[freq_index].envelope_index = (MAX_ATTACK * cur_amp); // depends on linear attack envelope
-        //printf("%.2f, %.2f\n", cur_amp, env[freq_index].attack[bank[freq_index].envelope_index]);
-    }
-    else {
-        bank[freq_index].envelope_index = 0;
+    if (SDL_LockMutex(mutex) == 0) {
+        //bank[freq_index].phase_index = 0;
+        bank[freq_index].phase_step = freq_table[freq_index] / FUNDAMENTAL_FREQ;
+        bank[freq_index].gain = gain;
+        bank[freq_index].octave = freq_index / 12;
+        bank[freq_index].type = type;
+        bank[freq_index].envelope_stage = ATTACK;
+        int cur_index = bank[freq_index].envelope_index;
+        if (cur_index > 0) {
+            float cur_amp = env[freq_index].release[cur_index];
+            bank[freq_index].envelope_index = (MAX_ATTACK * cur_amp); // depends on linear attack envelope
+            //printf("%.2f, %.2f\n", cur_amp, env[freq_index].attack[bank[freq_index].envelope_index]);
+        }
+        else {
+            bank[freq_index].envelope_index = 0;
+        }
+        SDL_UnlockMutex(mutex);
     }
 }
 
 void kill_oscillator(oscillator *bank, int freq_index)
 {
-    bank[freq_index].envelope_stage = RELEASE;
-    //bank[freq_index].envelope_index = 0;
+    if (SDL_LockMutex(mutex) == 0) {
+        bank[freq_index].envelope_stage = RELEASE;
+        //bank[freq_index].envelope_index = 0;
+        SDL_UnlockMutex(mutex);
+    }
 }
 
 
@@ -478,58 +485,6 @@ float proc_envelope(oscillator *bank, envelope *env, int i)
     return env_val;
 }
 
-/* This routine will be called by the PortAudio engine when audio is needed.
- * It may called at interrupt level on some machines so don't do anything
- * that could mess up the system like calling malloc() or free().
- */
-static int patestCallback(const void *inputBuffer, void *outputBuffer,
-                          unsigned long framesPerBuffer,
-                          const PaStreamCallbackTimeInfo* timeInfo,
-                          PaStreamCallbackFlags statusFlags,
-                          void *userData)
-{
-    struct shared_audio_data data = *((struct shared_audio_data*) userData);
-    oscillator *bank = data.bank;
-    envelope *env = data.env;
-    float *out = (float*)outputBuffer;
-
-    /* prevent unused variable warnings */
-    (void) timeInfo;
-    (void) statusFlags;
-    (void) inputBuffer;
-
-    int i, j;
-    for (i = 0; i < framesPerBuffer; i++) {
-        float samp = 0;
-        for (j = 0; j < N_OSCILLATORS; j++) {
-            if (bank[j].gain > 0) {
-                float env_val = proc_envelope(bank, env, j);
-                //printf("%.2f \n", env_val);
-                samp += env_val * interpolate(bank[j]) * bank[j].gain * volume;
-                bank[j].phase_index += bank[j].phase_step;
-                if (bank[j].phase_index >= TABLE_SIZE) {
-                    bank[j].phase_index -= TABLE_SIZE;
-                }
-            }
-        }
-        *out++ = samp;
-
-        display_in[i] = samp;
-    }
-
-    if (domain == FREQ_DOMAIN) {
-        kiss_fftr(display_cfg, display_in, display_out);
-        update_points_freq(points_freq, display_out);
-        refresh_signal(renderer, points_freq, N_POINTS_FREQ);
-    }
-    else if (domain == TIME_DOMAIN) {
-        update_points_time(points_time, out-framesPerBuffer);
-        refresh_signal(renderer, points_time, N_POINTS_TIME);
-    }
-    
-    return paContinue;
-}
-
 PaError stop_PA(PaStream *stream)
 {
     PaError err;
@@ -567,8 +522,8 @@ PaError setup_PA(PaStream **stream, struct shared_audio_data *data)
                         SAMPLE_RATE,
                         FRAMES_PER_BUFFER,
                         paClipOff, /* we won't output out of range samples so don't bother clipping them */
-                        patestCallback,
-                        data);
+                        NULL/*patestCallback*/,
+                        NULL/*data*/);
     if (err != paNoError) return err;
 
     err = Pa_StartStream(*stream);
@@ -749,6 +704,66 @@ static void net_thread(void *user_data)
     }
 }
 
+static void av_thread(void *user_data)
+{
+    PaStream *stream;
+    PaError err = setup_PA(&stream, (struct shared_audio_data*) user_data);
+    if (err != paNoError) {
+        SDLNet_Quit();
+        SDL_DestroyMutex(mutex);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        Pa_Terminate();
+        print_PA_err(err);
+        return;
+    }
+
+    struct shared_audio_data data = *((struct shared_audio_data*) user_data);
+    oscillator *bank = data.bank;
+    envelope *env = data.env;
+    
+    float out[FRAMES_PER_BUFFER];
+
+    int i, j;
+    while(1) {
+        if (SDL_LockMutex(mutex) == 0) {
+            for (i = 0; i < FRAMES_PER_BUFFER; i++) {
+                float samp = 0;
+                for (j = 0; j < N_OSCILLATORS; j++) {
+                    if (bank[j].gain > 0) {
+                        float env_val = proc_envelope(bank, env, j);
+                        //printf("%.2f \n", env_val);
+                        samp += env_val * interpolate(bank[j]) * bank[j].gain * volume;
+                        bank[j].phase_index += bank[j].phase_step;
+                        if (bank[j].phase_index >= TABLE_SIZE) {
+                            bank[j].phase_index -= TABLE_SIZE;
+                        }
+                    }
+                }
+                out[i] = samp;
+
+                display_in[i] = samp;
+            }
+            SDL_UnlockMutex(mutex);
+        }
+
+        if (domain == FREQ_DOMAIN) {
+            kiss_fftr(display_cfg, display_in, display_out);
+            update_points_freq(points_freq, display_out);
+            refresh_signal(renderer, points_freq, N_POINTS_FREQ);
+        }
+        else if (domain == TIME_DOMAIN) {
+            update_points_time(points_time, out);
+            refresh_signal(renderer, points_time, N_POINTS_TIME);
+        }
+
+        PaError err = Pa_WriteStream(stream, out, FRAMES_PER_BUFFER);
+        if (err != paNoError) {
+            print_PA_err(err);
+        }
+    }
+}
+
 
 
 int main(int argc, char *argv[]) 
@@ -801,6 +816,12 @@ int main(int argc, char *argv[])
         SDL_Quit();
         return -1;
     }
+    mutex = SDL_CreateMutex();
+    if (!mutex) {
+        fprintf(stderr, "Could not create mutex\n");
+        SDL_Quit();
+        return -1;
+    }
     
     //if (setup_SDLNet((argc > 1) ? argv[1] : NULL, (argc > 2) ? atoi(argv[2]) : 4231)) {
     if (setup_SDLNet(get_ini_string(ini_buf, "host_ip", fp), atoi(get_ini_string(ini_buf, "port", fp)))) {
@@ -810,26 +831,22 @@ int main(int argc, char *argv[])
         }
     }
 
-    PaStream *stream;
-    PaError err = setup_PA(&stream, &pa_data);
-    if (err != paNoError) {
-        SDLNet_Quit();
-        SDL_DestroyWindow(window);
+    SDL_Thread *av_thread_p = SDL_CreateThread((SDL_ThreadFunction)av_thread, "Audio Thread", &pa_data);
+    if (!av_thread_p) {
+        fprintf(stderr, "SDL could not create a new thread, SDL_Error: %s\n", SDL_GetError());
         SDL_Quit();
-        Pa_Terminate();
-        print_PA_err(err);
         return -1;
     }
 
-    print_info();
 
+    print_info();
 
                    /* '[', '\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 
                     * 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 
                     * 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z' */
     int char_map[] = { 11,   0,  12,   0,   0,   0,   0,   0,   0,   0,   3,   
                         0,   0,   0,   8,   0,   0,   0,   0,   0,   9,  10,
-                        1,   4,   0,   5,   7,   0,   2,   0,   6,   0};
+                        1,   4,   0,   5,   7,   0,   2,   0,   6,   0 };
     int octave_map[12];
     wave_t wave_type = 0;
     int octave = 1;
@@ -912,89 +929,19 @@ int main(int argc, char *argv[])
     kiss_fft_cleanup();
 
     SDLNet_Quit();
+    SDL_DestroyMutex(mutex);
     SDL_DestroyWindow(window);
     SDL_Quit();
 
+    /*
     err = stop_PA(stream);
     if (err != paNoError) {
         Pa_Terminate();
         print_PA_err(err);
         return -1;
     }
+    */
 
     printf("\nDone.\n");
     return 0;
 }
-
-
-#if 0
-void test_points_time(wave_t wave_type, int octave)
-{
-    int i;
-    for (i = 0; i < N_POINTS_TIME; i++) {
-        points_time[i].x = i * X_SCALE_TIME;
-        points_time[i].y = (table[wave_type][octave][(i+1)*(TABLE_SIZE/N_POINTS_TIME)-1]*-1.0 + 1) / 2.0 * (Y_SCALE_TIME);
-    }
-    refresh_signal(renderer, points_time, N_POINTS_TIME);
-    /*
-    int n = 10;
-    printf("first %d samples:\n", n);
-    for (i = 0; i < n; i++) printf("%.2f\n", table[wave_type][octave][i]);
-    printf("last %d samples:\n", n);
-    for (i = 0; i < n; i++) printf("%.2f\n", table[wave_type][octave][TABLE_SIZE-n+i]);
-    */
-}
-
-float*** alloc_wavetables(void)
-{
-    float ***wt;
-    wt = malloc(N_WAVE_TYPES * sizeof(float**));
-    if (wt == NULL) return NULL;
-    int i, j;
-    for (i = 0; i < N_WAVE_TYPES; i++) {
-        wt[i] = malloc(N_OCTAVES * sizeof(float*));
-        if (wt[i] == NULL) return NULL;
-        for (j = 0; j < N_OCTAVES; j++) {
-            wt[i][j] = malloc(TABLE_SIZE * sizeof(float));
-            if (wt[i][j] == NULL) return NULL;
-        }
-    }
-    return wt;
-}
-
-void calc_wavetables(void)
-{
-    int i, j;
-    for (i = 0; i < TABLE_SIZE; i++) {
-        for (j = 0; j < N_OCTAVES; j++) {
-            /* create sine wave */
-            table[SINE][j][i] = sin((i/(double)TABLE_SIZE) * M_PI * 2.0);
-            /* create square wave */
-            if (i < TABLE_SIZE / 2)
-                table[SQUARE][j][i] = 1.0;
-            else 
-                table[SQUARE][j][i] = -1.0;
-            /* create sawtooth wave */
-            table[SAW][j][i] = ((i/(double)TABLE_SIZE)*2) - 1;
-        }
-    }
-}
-
-
-void print_envelopes(void)
-{
-    int i;
-    printf("\nATTACK\n");
-    for (i = 0; i < MAX_ATTACK; i++) {
-        printf("%.2f ", env.attack[i]);
-    }
-    printf("\nDECAY\n");
-    for (i = 0; i < MAX_DECAY; i++) {
-        printf("%.2f ", env.decay[i]);
-    }
-    printf("\nRELEASE\n");
-    for (i = 0; i < MAX_RELEASE; i++) {
-        printf("%.2f ", env.release[i]);
-    }
-}
-#endif
